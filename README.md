@@ -45,6 +45,17 @@ By default it will use anonymous account ([view which apps are available on it h
 To use your account, specify the `-username <username>` parameter. Password will be asked interactively if you do
 not use specify the `-password` parameter.
 
+### Downloading depots from local manifest files
+```powershell
+./DepotDownloader -manifest-dir <dir> [-app <id>] [other options]
+./DepotDownloader -manifest-file <file.manifest> -depot-key <hex> [-app <id>] [other options]
+```
+
+`-manifest-dir` recursively scans the directory for `.manifest` files, and for depot keys and manifest ids in
+`.vdf` and `.lua` files, so manifest packages that only ship a `appinfo.vdf` or a `appid.lua` work as well.
+Depots without a local manifest are downloaded using the manifest id, which requires `-app` when the app id is not
+contained in a `.lua` file.
+
 ### Downloading a workshop item using pubfile id
 ```powershell
 ./DepotDownloader -app <id> -pubfile <id> [-username <username> [-password <password>]]
@@ -96,9 +107,14 @@ Parameter               | Description
 `-language <lang>`      | the language for which to download the game (default: english)
 `-lowviolence`          | download low violence depots when `-app` is used.
 `-dir <installdir>`     | the directory in which to place downloaded files.
+`-o <installdir>`       | alias for `-dir`.
 `-filelist <file.txt>`  | the name of a local file that contains a list of files to download (from the manifest). prefix file path with `regex:` if you want to match with regex. each file path should be on their own line.
+`-p <regex>`            | only download files whose path matches this regular expression.
 `-validate`             | include checksum verification of files already downloaded.
 `-manifest-only`        | downloads a human readable manifest for any depots that would be downloaded.
+`-manifest-dir <dir>`   | download depots using the local `.manifest` files, depot keys and manifest ids found in `<dir>`. `.vdf` and `.lua` files in the directory are scanned for depot keys and manifest ids.
+`-manifest-file <file>` | download a depot using this local `.manifest` file. Can be specified multiple times, requires a matching `-depot-key`.
+`-depot-key <hex>`      | hex encoded depot decryption key for the matching `-manifest-file`.
 `-cellid <#>`           | the overridden CellID of the content server to download from.
 `-max-downloads <#>`    | maximum number of chunks to download concurrently. (default: 8).
 `-use-lancache`         | forces downloads over the local network via a Lancache instance.

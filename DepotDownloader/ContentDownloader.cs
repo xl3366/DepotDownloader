@@ -96,10 +96,15 @@ namespace DepotDownloader
 
         static bool TestIsFileIncluded(string filename)
         {
+            filename = filename.Replace('\\', '/');
+
+            if (Config.FilePattern != null && !Config.FilePattern.IsMatch(filename))
+            {
+                return false;
+            }
+
             if (!Config.UsingFileList)
                 return true;
-
-            filename = filename.Replace('\\', '/');
 
             if (Config.FilesToDownload.Contains(filename))
             {
@@ -115,6 +120,11 @@ namespace DepotDownloader
             }
 
             return false;
+        }
+
+        static uint GetAuthAppId(uint appId)
+        {
+            return appId == INVALID_APP_ID ? 0 : appId;
         }
 
         static async Task<bool> AccountHasAccess(uint appId, uint depotId)
@@ -599,6 +609,171 @@ namespace DepotDownloader
             }
         }
 
+        static List<DepotManifestEntry> GetExplicitManifestEntries()
+        {
+            if (Config.ManifestFiles.Count != Config.DepotKeys.Count)
+            {
+                throw new ContentDownloaderException("One -depot-key is required for every -manifest-file.");
+            }
+
+            var entries = new List<DepotManifestEntry>();
+
+            for (var i = 0; i < Config.ManifestFiles.Count; i++)
+            {
+                var manifestFile = Config.ManifestFiles[i];
+
+                DepotManifest manifest;
+
+                try
+                {
+                    manifest = DepotManifest.LoadFromFile(manifestFile);
+                }
+                catch (Exception ex)
+                {
+                    throw new ContentDownloaderException(string.Format("Unable to load manifest '{0}': {1}", manifestFile, ex.Message));
+                }
+
+                if (manifest == null)
+                {
+                    throw new ContentDownloaderException(string.Format("Unable to load manifest '{0}'", manifestFile));
+                }
+
+                entries.Add(new DepotManifestEntry
+                {
+                    AppId = Config.LocalAppId,
+                    DepotId = manifest.DepotID,
+                    ManifestId = manifest.ManifestGID,
+                    DepotKey = Config.DepotKeys[i],
+                    ManifestFile = manifestFile,
+                });
+            }
+
+            return entries;
+        }
+
+        static string GetLocalInstallDir(uint appId)
+        {
+            if (!string.IsNullOrWhiteSpace(Config.InstallDirectory))
+            {
+                return Config.InstallDirectory;
+            }
+
+            var name = appId != INVALID_APP_ID
+                ? appId.ToString()
+                : Config.ManifestDirectory != null
+                    ? new DirectoryInfo(Config.ManifestDirectory).Name
+                    : "depots";
+
+            return Path.Combine(Directory.GetCurrentDirectory(), name);
+        }
+
+        public static async Task DownloadLocalManifestsAsync()
+        {
+            var entries = Config.ManifestDirectory != null
+                ? ManifestFileParser.ParseDirectory(Config.ManifestDirectory)
+                : GetExplicitManifestEntries();
+
+            if (entries.Count == 0)
+            {
+                throw new ContentDownloaderException("No depot manifests or depot keys were found.");
+            }
+
+            var depotsToDownload = new List<DepotManifestEntry>();
+
+            foreach (var entry in entries)
+            {
+                if (entry.ManifestFile == null && entry.ManifestId == INVALID_MANIFEST_ID)
+                {
+                    Console.WriteLine("Skipping depot {0}, no manifest file or manifest id was found for it.", entry.DepotId);
+                    continue;
+                }
+
+                if (entry.DepotKey == null)
+                {
+                    throw new ContentDownloaderException(string.Format("No depot key found for depot {0}.", entry.DepotId));
+                }
+
+                depotsToDownload.Add(entry);
+            }
+
+            if (depotsToDownload.Count == 0)
+            {
+                throw new ContentDownloaderException("No depot manifests or manifest ids were found.");
+            }
+
+            var appId = Config.LocalAppId;
+            if (appId == INVALID_APP_ID)
+            {
+                foreach (var entry in depotsToDownload)
+                {
+                    if (entry.AppId != 0)
+                    {
+                        appId = entry.AppId;
+                        break;
+                    }
+                }
+
+                if (appId == INVALID_APP_ID)
+                {
+                    Console.WriteLine("Warning: The app id is unknown, use -app if the CDN asks for an auth token.");
+                }
+            }
+
+            var installDir = GetLocalInstallDir(appId);
+            var configDir = Path.Combine(installDir, CONFIG_DIR);
+
+            Directory.CreateDirectory(installDir);
+            Directory.CreateDirectory(configDir);
+            Directory.CreateDirectory(Path.Combine(installDir, STAGING_DIR));
+
+            DepotConfigStore.LoadFromFile(Path.Combine(configDir, "depot.config"));
+
+            foreach (var entry in depotsToDownload)
+            {
+                if (entry.ManifestFile != null)
+                {
+                    var localManifest = DepotManifest.LoadFromFile(entry.ManifestFile);
+
+                    if (localManifest == null)
+                    {
+                        throw new ContentDownloaderException(string.Format("Unable to load manifest '{0}'", entry.ManifestFile));
+                    }
+
+                    if (localManifest.FilenamesEncrypted && !localManifest.DecryptFilenames(entry.DepotKey))
+                    {
+                        throw new ContentDownloaderException(string.Format("Unable to decrypt file names in manifest '{0}'. Is the depot key correct?", entry.ManifestFile));
+                    }
+
+                    if (!Util.SaveManifestToFile(configDir, localManifest))
+                    {
+                        throw new ContentDownloaderException(string.Format("Unable to save manifest for depot {0}", entry.DepotId));
+                    }
+
+                    entry.ManifestId = localManifest.ManifestGID;
+                }
+                else if (appId == INVALID_APP_ID)
+                {
+                    throw new ContentDownloaderException(string.Format("Depot {0} has no local manifest, so -app is required to download manifest {1}.", entry.DepotId, entry.ManifestId));
+                }
+            }
+
+            cdnPool = new CDNClientPool(steam3, appId);
+
+            var depotInfos = depotsToDownload
+                .Select(entry => new DepotDownloadInfo(entry.DepotId, appId, entry.ManifestId, DEFAULT_BRANCH, installDir, entry.DepotKey))
+                .ToList();
+
+            try
+            {
+                await DownloadSteam3Async(depotInfos).ConfigureAwait(false);
+            }
+            catch (OperationCanceledException)
+            {
+                Console.WriteLine("Depots were not completely downloaded.");
+                throw;
+            }
+        }
+
         static async Task<DepotDownloadInfo> GetDepotInfo(uint depotId, uint appId, ulong manifestId, string branch)
         {
             if (steam3 != null && appId != INVALID_APP_ID)
@@ -675,6 +850,7 @@ namespace DepotDownloader
             public DepotManifest previousManifest;
             public List<DepotManifest.FileData> filteredFiles;
             public HashSet<string> allFileNames;
+            public bool sharedInstallDir;
         }
 
         private class FileStreamData
@@ -726,7 +902,8 @@ namespace DepotDownloader
 
             // If we're about to write all the files to the same directory, we will need to first de-duplicate any files by path
             // This is in last-depot-wins order, from Steam or the list of depots supplied by the user
-            if (!string.IsNullOrWhiteSpace(Config.InstallDirectory) && depotsToDownload.Count > 0)
+            var isSharedInstallDir = depots.Select(x => x.InstallDir).Distinct().Count() < depots.Count;
+            if (isSharedInstallDir && depotsToDownload.Count > 0)
             {
                 var claimedFileNames = new HashSet<string>();
 
@@ -741,6 +918,7 @@ namespace DepotDownloader
 
             foreach (var depotFileData in depotsToDownload)
             {
+                depotFileData.sharedInstallDir = isSharedInstallDir;
                 await DownloadSteam3AsyncDepotFiles(cts, downloadCounter, depotFileData, allFileNamesAllDepots);
             }
 
@@ -857,7 +1035,7 @@ namespace DepotDownloader
                             // If the CDN returned 403, attempt to get a cdn auth if we didn't yet
                             if (e.StatusCode == HttpStatusCode.Forbidden && !steam3.CDNAuthTokens.ContainsKey((depot.DepotId, connection.Host)))
                             {
-                                await steam3.RequestCDNAuthToken(depot.AppId, depot.DepotId, connection);
+                                await steam3.RequestCDNAuthToken(GetAuthAppId(depot.AppId), depot.DepotId, connection);
 
                                 cdnPool.ReturnConnection(connection);
 
@@ -990,7 +1168,7 @@ namespace DepotDownloader
                 var previousFilteredFiles = depotFilesData.previousManifest.Files.AsParallel().Where(f => TestIsFileIncluded(f.FileName)).Select(f => f.FileName).ToHashSet();
 
                 // Check if we are writing to a single output directory. If not, each depot folder is managed independently
-                if (string.IsNullOrWhiteSpace(Config.InstallDirectory))
+                if (!depotFilesData.sharedInstallDir)
                 {
                     // Of the list of files in the previous manifest, remove any file names that exist in the current set of all file names
                     previousFilteredFiles.ExceptWith(depotFilesData.allFileNames);
@@ -1287,7 +1465,7 @@ namespace DepotDownloader
                         if (e.StatusCode == HttpStatusCode.Forbidden &&
                             (!steam3.CDNAuthTokens.TryGetValue((depot.DepotId, connection.Host), out var authTokenCallbackPromise) || !authTokenCallbackPromise.Task.IsCompleted))
                         {
-                            await steam3.RequestCDNAuthToken(depot.AppId, depot.DepotId, connection);
+                            await steam3.RequestCDNAuthToken(GetAuthAppId(depot.AppId), depot.DepotId, connection);
 
                             cdnPool.ReturnConnection(connection);
 

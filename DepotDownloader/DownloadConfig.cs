@@ -19,6 +19,8 @@ namespace DepotDownloader
         public HashSet<string> FilesToDownload { get; set; }
         public List<Regex> FilesToDownloadRegex { get; set; }
 
+        public Regex FilePattern { get; set; }
+
         public string BetaPassword { get; set; }
 
         public bool VerifyAll { get; set; }
@@ -32,5 +34,10 @@ namespace DepotDownloader
 
         public bool UseQrCode { get; set; }
         public bool SkipAppConfirmation { get; set; }
+
+        public string ManifestDirectory { get; set; }
+        public List<string> ManifestFiles { get; set; } = [];
+        public List<byte[]> DepotKeys { get; set; } = [];
+        public uint LocalAppId { get; set; }
     }
 }

@@ -134,7 +134,22 @@ namespace DepotDownloader
                 }
             }
 
-            ContentDownloader.Config.InstallDirectory = GetParameter<string>(args, "-dir");
+            ContentDownloader.Config.InstallDirectory = GetParameter<string>(args, "-dir") ?? GetParameter<string>(args, "-output") ?? GetParameter<string>(args, "-o");
+
+            var pattern = GetParameter<string>(args, "-pattern") ?? GetParameter<string>(args, "-p");
+
+            if (pattern != null)
+            {
+                try
+                {
+                    ContentDownloader.Config.FilePattern = new Regex(pattern, RegexOptions.Compiled | RegexOptions.IgnoreCase);
+                }
+                catch (ArgumentException ex)
+                {
+                    Console.WriteLine("Error: -pattern is not a valid regular expression: {0}", ex.Message);
+                    return 1;
+                }
+            }
 
             ContentDownloader.Config.VerifyAll = HasParameter(args, "-verify-all") || HasParameter(args, "-verify_all") || HasParameter(args, "-validate");
 
@@ -159,11 +174,112 @@ namespace DepotDownloader
 
             #endregion
 
+            #region Local Manifest Options
+
+            ContentDownloader.Config.ManifestDirectory = GetParameter<string>(args, "-manifest-dir");
+
+            foreach (var manifestFile in GetParameterListAll<string>(args, "-manifest-file"))
+            {
+                ContentDownloader.Config.ManifestFiles.Add(manifestFile);
+            }
+
+            foreach (var depotKey in GetParameterListAll<string>(args, "-depot-key"))
+            {
+                try
+                {
+                    ContentDownloader.Config.DepotKeys.Add(Convert.FromHexString(depotKey));
+                }
+                catch (FormatException)
+                {
+                    Console.WriteLine("Error: -depot-key must be a hex encoded string.");
+                    return 1;
+                }
+            }
+
+            if (ContentDownloader.Config.ManifestDirectory != null && ContentDownloader.Config.ManifestFiles.Count > 0)
+            {
+                Console.WriteLine("Error: -manifest-dir and -manifest-file can not be used together.");
+                return 1;
+            }
+
+            if (ContentDownloader.Config.ManifestFiles.Count > 0 && ContentDownloader.Config.DepotKeys.Count == 0)
+            {
+                Console.WriteLine("Error: -depot-key is required when -manifest-file is used.");
+                return 1;
+            }
+
+            if (ContentDownloader.Config.DepotKeys.Count > 0 && ContentDownloader.Config.ManifestFiles.Count == 0)
+            {
+                Console.WriteLine("Error: -manifest-file is required when -depot-key is used.");
+                return 1;
+            }
+
+            if (ContentDownloader.Config.ManifestDirectory != null && !Directory.Exists(ContentDownloader.Config.ManifestDirectory))
+            {
+                Console.WriteLine("Error: -manifest-dir '{0}' is not a directory.", ContentDownloader.Config.ManifestDirectory);
+                return 1;
+            }
+
+            foreach (var manifestFile in ContentDownloader.Config.ManifestFiles)
+            {
+                if (!File.Exists(manifestFile))
+                {
+                    Console.WriteLine("Error: -manifest-file '{0}' does not exist.", manifestFile);
+                    return 1;
+                }
+            }
+
+            var useLocalManifests = ContentDownloader.Config.ManifestDirectory != null || ContentDownloader.Config.ManifestFiles.Count > 0;
+
+            #endregion
+
             var appId = GetParameter(args, "-app", ContentDownloader.INVALID_APP_ID);
-            if (appId == ContentDownloader.INVALID_APP_ID)
+            if (appId == ContentDownloader.INVALID_APP_ID && !useLocalManifests)
             {
                 Console.WriteLine("Error: -app not specified!");
                 return 1;
+            }
+
+            ContentDownloader.Config.LocalAppId = appId;
+
+            if (useLocalManifests)
+            {
+                #region Local Manifest Downloading
+
+                PrintUnconsumedArgs(args);
+
+                if (InitializeSteam(username, password))
+                {
+                    try
+                    {
+                        await ContentDownloader.DownloadLocalManifestsAsync().ConfigureAwait(false);
+                    }
+                    catch (Exception ex) when (
+                        ex is ContentDownloaderException
+                        || ex is OperationCanceledException)
+                    {
+                        Console.WriteLine(ex.Message);
+                        return 1;
+                    }
+                    catch (Exception e)
+                    {
+                        Console.WriteLine("Download failed to due to an unhandled exception: {0}", e.Message);
+                        throw;
+                    }
+                    finally
+                    {
+                        ContentDownloader.ShutdownSteam3();
+                    }
+                }
+                else
+                {
+                    Console.WriteLine("Error: InitializeSteam failed");
+                    return 1;
+                }
+
+                return 0;
+
+                #endregion
             }
 
             var pubFile = GetParameter(args, "-pubfile", ContentDownloader.INVALID_MANIFEST_ID);
@@ -462,6 +578,34 @@ namespace DepotDownloader
             return list;
         }
 
+        static List<T> GetParameterListAll<T>(string[] args, string param)
+        {
+            var list = new List<T>();
+
+            for (var argIndex = 0; argIndex < args.Length; argIndex++)
+            {
+                if (!args[argIndex].Equals(param, StringComparison.OrdinalIgnoreCase))
+                    continue;
+
+                consumedArgs[argIndex] = true;
+
+                var valueIndex = argIndex + 1;
+                while (valueIndex < args.Length)
+                {
+                    var strParam = args[valueIndex];
+
+                    if (strParam.Length == 0 || strParam[0] == '-') break;
+
+                    consumedArgs[valueIndex] = true;
+                    list.Add((T)Convert.ChangeType(strParam, typeof(T)));
+
+                    valueIndex++;
+                }
+            }
+
+            return list;
+        }
+
         static void PrintUnconsumedArgs(string[] args)
         {
             var printError = false;
@@ -489,6 +633,16 @@ namespace DepotDownloader
             Console.WriteLine("Usage: downloading one or all depots for an app:");
             Console.WriteLine("       depotdownloader -app <id> [-depot <id> [-manifest <id>]]");
             Console.WriteLine("                       [-username <username> [-password <password>]] [other options]");
+            Console.WriteLine();
+            Console.WriteLine("Usage: downloading depots from local manifest files:");
+            Console.WriteLine("       depotdownloader -manifest-dir <dir> [-app <id>] [other options]");
+            Console.WriteLine("       depotdownloader -manifest-file <file.manifest> -depot-key <hex> [-app <id>] [other options]");
+            Console.WriteLine();
+            Console.WriteLine("  The local manifest directory is scanned for .manifest files as well as depot keys and");
+            Console.WriteLine("  manifest ids from .vdf and .lua files. A .lua file may look like:");
+            Console.WriteLine("      addappid(<appid>)");
+            Console.WriteLine("      addappid(<depotid>, 1, \"<depot decryption key>\")");
+            Console.WriteLine("      setManifestid(<depotid>, \"<manifest id>\")");
             Console.WriteLine();
             Console.WriteLine("Usage: downloading a workshop item using pubfile id");
             Console.WriteLine("       depotdownloader -app <id> -pubfile <id> [-username <username> [-password <password>]]");
@@ -520,11 +674,16 @@ namespace DepotDownloader
             Console.WriteLine("  -no-mobile               - prefer entering a 2FA code instead of prompting to accept in the Steam mobile app");
             Console.WriteLine();
             Console.WriteLine("  -dir <installdir>        - the directory in which to place downloaded files.");
+            Console.WriteLine("  -o <installdir>          - alias for -dir.");
             Console.WriteLine("  -filelist <file.txt>     - the name of a local file that contains a list of files to download (from the manifest).");
             Console.WriteLine("                             prefix file path with `regex:` if you want to match with regex. each file path should be on their own line.");
+            Console.WriteLine("  -p <regex>               - only download files whose path matches this regular expression.");
             Console.WriteLine();
             Console.WriteLine("  -validate                - include checksum verification of files already downloaded");
             Console.WriteLine("  -manifest-only           - downloads a human readable manifest for any depots that would be downloaded.");
+            Console.WriteLine("  -manifest-dir <dir>      - download depots using local .manifest files, depot keys and manifest ids found in <dir>.");
+            Console.WriteLine("  -manifest-file <file>    - download a depot using this local .manifest file. Can be specified multiple times, requires -depot-key.");
+            Console.WriteLine("  -depot-key <hex>         - hex encoded depot decryption key for the matching -manifest-file.");
             Console.WriteLine("  -cellid <#>              - the overridden CellID of the content server to download from.");
             Console.WriteLine("  -max-downloads <#>       - maximum number of chunks to download concurrently. (default: 8).");
             Console.WriteLine("  -loginid <#>             - a unique 32-bit integer Steam LogonID in decimal, required if running multiple instances of DepotDownloader concurrently.");
